@@ -64,7 +64,15 @@ export async function handleFreeAdmin(req: Request, url: URL): Promise<Response>
  *   perCred   每套凭据最多几条,默认 3(见 free/identity.ts 里 CF 扇出那段)
  *   protos    逗号分隔的协议白名单,不填就是全部
  *   days      只要最近几天还出现过的,默认 7
+ *   order     popular(默认,反复出现过的优先) | stale(最久没测的优先,没测过的排最前)
  *   format    uris(默认,每行一条分享链接) | base64(整段 base64,跟 /push 的格式一致) | json
+ *
+ * **实测要用 order=stale。** 默认的 popular 排序是确定性的,每轮都返回同一批 ——
+ * 跑七轮等于把同样那几十条测了七遍,池子里其余几千条一次都轮不到,而且从结果上
+ * 完全看不出来,只会显得"池子里就这些节点"。
+ *
+ * format=json 的每一行都带 check 字段(测过几次 / 通了几次 / 最后一次 / 延迟中位数),
+ * 界面上的筛选条件全从它来。uris 和 base64 两种格式只出链接,不带这些。
  */
 export async function handleFreePool(req: Request, url: URL): Promise<Response> {
   if (!isPushKeyed(req)) return new Response("Unauthorized", { status: 401 });
@@ -73,7 +81,11 @@ export async function handleFreePool(req: Request, url: URL): Promise<Response> 
   }
 
   const q = url.searchParams;
+  // 认不出的 order 一律当 popular:实测那条路显式传 stale,传错了退回默认顺序
+  // 也只是测得不均匀,不该 400 把整轮实测卡住。
+  const order = q.get("order") === "stale" ? "stale" : "popular";
   const rows = await getPool({
+    order,
     // 下限也要夹。原来只有 Math.min(…, 5000),负数会原样传进 SQL,
     // Postgres 对 LIMIT -5 是直接报错("LIMIT must not be negative")、整个接口 500。
     // 接口本身有 PUSH_KEY 鉴权,不是安全问题,但没道理让一个手滑的参数把接口打挂。

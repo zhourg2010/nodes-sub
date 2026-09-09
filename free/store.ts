@@ -38,10 +38,31 @@ export interface FreeNode {
   sourceId: string;
 }
 
+/**
+ * 一个节点在**保留的那几轮**里的实测战绩。
+ *
+ * 为什么不是"最近 N 轮全通"这种说法:每一轮只测池子的一小批(客户端一轮几十到几百条,
+ * 池子是几千条),所以"第 5 轮"和"第 6 轮"测的根本不是同一批节点。对单个节点有意义的
+ * 只有"它自己被测过几次、其中通了几次"。
+ */
+export interface CheckStat {
+  /** 被测过几次。0 = 从来没测过 */
+  checked: number;
+  /** 其中通了几次 */
+  ok: number;
+  /** 最后一次的结果。没测过是 null —— 跟 false 不是一回事,不能混 */
+  lastOk: boolean | null;
+  /** 最后一次测的时间,'MM-DD HH:MM'。没测过是空串 */
+  lastTs: string;
+  /** 通的那几次的延迟中位数。一次都没通过是 null */
+  medianMs: number | null;
+}
+
 export interface PoolRow extends FreeNode {
   firstSeen: string;
   lastSeen: string;
   seenCount: number;
+  check: CheckStat;
 }
 
 let ready = false;
@@ -167,18 +188,49 @@ function toRow(r: Record<string, unknown>): PoolRow {
     firstSeen: String(r.first_seen),
     lastSeen: String(r.last_seen),
     seenCount: Number(r.seen_count),
+    check: {
+      // LEFT JOIN 没命中时这几列都是 null。checked 落成 0 而不是 null:
+      // 下游按"测过几次"筛的时候,0 是个能直接比较的值,null 得每处都先判一次。
+      checked: Number(r.chk_n ?? 0),
+      ok: Number(r.chk_ok ?? 0),
+      // 没测过是 null,**不是 false** —— 混起来的话"没测过"会被当成"测过且不通",
+      // 一整池还没轮到的节点会被判死刑。
+      lastOk: r.chk_last_ok == null ? null : Boolean(r.chk_last_ok),
+      lastTs: r.chk_last_ts == null ? "" : String(r.chk_last_ts),
+      medianMs: r.chk_median == null ? null : Number(r.chk_median),
+    },
   };
 }
 
 /**
- * 取节点池,给下游实测用。
+ * 取哪一批。
+ *
+ * - `popular` 反复出现过的优先。给"看池子里都有什么"用。
+ * - `stale`   **最久没测的优先,没测过的排最前**。给实测用。
+ *
+ * `stale` 是必须的,不是可选项:池子是几千条,客户端一轮只测几十到几百条。按 `popular`
+ * 取的话每一轮拿到的是**同一批**(排序是确定性的),测七轮等于把同样那批测了七遍,
+ * 其余的一次都轮不到 —— 而且从结果上完全看不出来,只会显得"池子里只有这些节点"。
+ */
+export type PoolOrder = "popular" | "stale";
+
+/**
+ * 取节点池。
  *
  * perCred 是**这个函数存在的理由**:每套凭据最多取几条。不限的话,一个源的 CF 扇出
  * (同一套凭据 × 一千多个边缘 IP)会把整个返回集占满,别的源一条都排不进来。
- * 排序用 seen_count DESC —— 反复出现过的优先,它们更可能还活着。
+ *
+ * 每行都带上它自己的实测战绩(见 CheckStat)。没测过的那些 LEFT JOIN 不命中,
+ * checked 是 0 —— 调用方能分得清"测过且不通"和"还没轮到"。
  */
 export async function getPool(
-  opts: { limit?: number; perCred?: number; protos?: string[]; freshDays?: number } = {},
+  opts: {
+    limit?: number;
+    perCred?: number;
+    protos?: string[];
+    freshDays?: number;
+    order?: PoolOrder;
+  } = {},
 ): Promise<PoolRow[]> {
   if (!sql) return [];
   await ensureTables();
@@ -186,18 +238,46 @@ export async function getPool(
   const perCred = opts.perCred ?? 3;
   const freshDays = opts.freshDays ?? 7;
   const protos = opts.protos ?? [];
+  const stale = opts.order === "stale";
 
   const rows = await sql`
+    WITH chk AS (
+      SELECT uri_hash,
+             count(*)::int AS n,
+             count(*) FILTER (WHERE ok)::int AS n_ok,
+             -- 排序用的"多久没碰过它了"取 max(ts):stale 问的是时间。
+             max(ts) AS last_ts,
+             -- 给人看的那对(结果 + 时间)必须来自**同一行**,都按轮号取最大那条。
+             -- 分开取的话(结果按轮、时间按 max(ts)),时间戳乱序时会显示成
+             -- "05:29 通了",而 05:29 那条记的其实是不通 —— 一个对不上还查不出的界面。
+             -- 用 array_agg 而不是窗口函数,是因为这里已经 GROUP BY 了。
+             (array_agg(ok ORDER BY round DESC))[1] AS last_ok,
+             to_char((array_agg(ts ORDER BY round DESC))[1], 'MM-DD HH24:MI') AS last_ts_txt,
+             percentile_disc(0.5) WITHIN GROUP (ORDER BY latency_ms)
+               FILTER (WHERE ok AND latency_ms IS NOT NULL)::int AS median_ms
+      FROM free_check GROUP BY uri_hash
+    )
     SELECT * FROM (
-      SELECT *, row_number() OVER (
-        PARTITION BY cred_id ORDER BY seen_count DESC, last_seen DESC
-      ) AS rn
-      FROM free_node
-      WHERE last_seen >= now() - (${freshDays}::int * interval '1 day')
-        AND (${protos.length === 0}::boolean OR proto = ANY(${protos}::text[]))
+      SELECT n.*,
+             c.n           AS chk_n,
+             c.n_ok        AS chk_ok,
+             c.last_ok     AS chk_last_ok,
+             c.last_ts_txt AS chk_last_ts,
+             c.median_ms   AS chk_median,
+             c.last_ts     AS chk_last_at,
+             row_number() OVER (
+               PARTITION BY n.cred_id ORDER BY n.seen_count DESC, n.last_seen DESC
+             ) AS rn
+      FROM free_node n
+      LEFT JOIN chk c ON c.uri_hash = n.uri_hash
+      WHERE n.last_seen >= now() - (${freshDays}::int * interval '1 day')
+        AND (${protos.length === 0}::boolean OR n.proto = ANY(${protos}::text[]))
     ) t
     WHERE rn <= ${perCred}
-    ORDER BY seen_count DESC, last_seen DESC
+    -- stale 为假时第一个排序键对每一行都是 NULL,全部并列,直接落到后面两个键,
+    -- 也就是原来的 popular 顺序。写成一条查询而不是两条,免得两边改一处漏一处。
+    ORDER BY (CASE WHEN ${stale}::boolean THEN chk_last_at END) ASC NULLS FIRST,
+             seen_count DESC, last_seen DESC
     LIMIT ${limit}`;
   return (rows as Record<string, unknown>[]).map(toRow);
 }
